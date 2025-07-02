@@ -1,13 +1,19 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"log"
 	"net/http"
 	"os"
 	"strconv"
 	"strings"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/joho/godotenv"
 )
+
+var db *pgxpool.Pool
 
 type Todo struct {
 	ID    int    `json:"id"`
@@ -15,59 +21,58 @@ type Todo struct {
 	Done  bool   `json:"done"`
 }
 
-var (
-	todos  = []Todo{}
-	nextID = 1
-	dbFile = "todos.json"
-)
+func initializeDatabase() {
+	databaseURL := os.Getenv("DATABASE_URL")
+	if databaseURL == "" {
+		log.Fatal("DATABASE_URL not set")
+	}
 
-func saveTodosToFile() {
-	data, err := json.MarshalIndent(todos, "", "  ")
+	var err error
+	db, err = pgxpool.New(context.Background(), databaseURL)
 	if err != nil {
-		log.Printf("Error marshaling todos: %v", err)
-		return
-	}
-	if err := os.WriteFile(dbFile, data, 0644); err != nil {
-		log.Printf("Error writing todos to file: %v", err)
-	}
-}
-
-func loadTodosFromFile() {
-	file, err := os.ReadFile(dbFile)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return
-		}
-		log.Fatalf("Error reading file: %v", err)
-	}
-	if err := json.Unmarshal(file, &todos); err != nil {
-		log.Fatalf("Error parsing file: %v", err)
-	}
-	for _, t := range todos {
-		if t.ID >= nextID {
-			nextID = t.ID + 1
-		}
+		log.Fatalf("Unable to connect to database: %v", err)
 	}
 }
 
 func getTodos(w http.ResponseWriter, _ *http.Request) {
+	rows, err := db.Query(context.Background(), "SELECT id, title, done FROM todos ORDER BY id")
+	if err != nil {
+		http.Error(w, "Failed to fetch todos", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	var todos []Todo
+	for rows.Next() {
+		var t Todo
+		err := rows.Scan(&t.ID, &t.Title, &t.Done)
+		if err == nil {
+			todos = append(todos, t)
+		}
+	}
+
 	json.NewEncoder(w).Encode(todos)
 }
 
-func getTodo(w http.ResponseWriter, r *http.Request) {
+func getTodoById(w http.ResponseWriter, r *http.Request) {
 	idStr := strings.TrimPrefix(r.URL.Path, "/todos/")
 	id, err := strconv.Atoi(idStr)
 	if err != nil {
 		http.Error(w, "Invalid ID", http.StatusBadRequest)
 		return
 	}
-	for _, t := range todos {
-		if t.ID == id {
-			json.NewEncoder(w).Encode(t)
-			return
-		}
+
+	var t Todo
+	err = db.QueryRow(context.Background(),
+		"SELECT id, title, done FROM todos WHERE id = $1", id).
+		Scan(&t.ID, &t.Title, &t.Done)
+
+	if err != nil {
+		http.NotFound(w, r)
+		return
 	}
-	http.NotFound(w, r)
+
+	json.NewEncoder(w).Encode(t)
 }
 
 func createTodo(w http.ResponseWriter, r *http.Request) {
@@ -76,10 +81,17 @@ func createTodo(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Bad Request", http.StatusBadRequest)
 		return
 	}
-	t.ID = nextID
-	nextID++
-	todos = append(todos, t)
-	saveTodosToFile()
+
+	err := db.QueryRow(context.Background(),
+		"INSERT INTO todos (title, done) VALUES ($1, $2) RETURNING id",
+		t.Title, t.Done).Scan(&t.ID)
+
+	if err != nil {
+		log.Printf("Failed to insert todo: %v", err)
+		http.Error(w, "Failed to insert", http.StatusInternalServerError)
+		return
+	}
+
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(t)
 }
@@ -91,21 +103,24 @@ func updateTodo(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Invalid ID", http.StatusBadRequest)
 		return
 	}
+
 	var updated Todo
 	if err := json.NewDecoder(r.Body).Decode(&updated); err != nil {
 		http.Error(w, "Bad Request", http.StatusBadRequest)
 		return
 	}
-	for i, t := range todos {
-		if t.ID == id {
-			updated.ID = id
-			todos[i] = updated
-			saveTodosToFile()
-			json.NewEncoder(w).Encode(updated)
-			return
-		}
+
+	_, err = db.Exec(context.Background(),
+		"UPDATE todos SET title = $1, done = $2 WHERE id = $3",
+		updated.Title, updated.Done, id)
+
+	if err != nil {
+		http.Error(w, "Update failed", http.StatusInternalServerError)
+		return
 	}
-	http.NotFound(w, r)
+
+	updated.ID = id
+	json.NewEncoder(w).Encode(updated)
 }
 
 func markAsDone(w http.ResponseWriter, r *http.Request) {
@@ -116,15 +131,23 @@ func markAsDone(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Invalid ID", http.StatusBadRequest)
 		return
 	}
-	for i, t := range todos {
-		if t.ID == id {
-			todos[i].Done = true
-			saveTodosToFile()
-			json.NewEncoder(w).Encode(todos[i])
-			return
-		}
+
+	_, err = db.Exec(context.Background(), "UPDATE todos SET done = true WHERE id = $1", id)
+	if err != nil {
+		http.Error(w, "Failed to mark done", http.StatusInternalServerError)
+		return
 	}
-	http.NotFound(w, r)
+
+	var t Todo
+	err = db.QueryRow(context.Background(), "SELECT id, title, done FROM todos WHERE id = $1", id).
+		Scan(&t.ID, &t.Title, &t.Done)
+
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+
+	json.NewEncoder(w).Encode(t)
 }
 
 func deleteTodo(w http.ResponseWriter, r *http.Request) {
@@ -134,15 +157,14 @@ func deleteTodo(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Invalid ID", http.StatusBadRequest)
 		return
 	}
-	for i, t := range todos {
-		if t.ID == id {
-			todos = append(todos[:i], todos[i+1:]...)
-			saveTodosToFile()
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
+
+	_, err = db.Exec(context.Background(), "DELETE FROM todos WHERE id = $1", id)
+	if err != nil {
+		http.Error(w, "Delete failed", http.StatusInternalServerError)
+		return
 	}
-	http.NotFound(w, r)
+
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func router(w http.ResponseWriter, r *http.Request) {
@@ -153,7 +175,7 @@ func router(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodPost && r.URL.Path == "/todos":
 		createTodo(w, r)
 	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/todos/"):
-		getTodo(w, r)
+		getTodoById(w, r)
 	case r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/todos/"):
 		updateTodo(w, r)
 	case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/todos/"):
@@ -166,8 +188,13 @@ func router(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
-	loadTodosFromFile()
+	err := godotenv.Load()
+	if err != nil {
+		log.Fatal("Error loading .env file")
+	}
+
+	initializeDatabase()
 	http.HandleFunc("/", router)
-	log.Println("Server listening at http://localhost:8080")
+	log.Println("Server running at http://localhost:8080")
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
